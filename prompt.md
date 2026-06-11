@@ -1,122 +1,125 @@
-You are working on a research-grade optical motion capture QC pipeline for OptiTrack Motive CSV exports.
+Read these files carefully before making changes:
 
-Read PROJECT_SPEC_MOTIVE_QC.md completely before writing code.
+1. PROJECT_SPEC_MOTIVE_QC.md
+2. CURSOR_PIPELINE_REVIEW_PROMPT_REVISED.md
+3. RAW_MOTIVE_MARKER_QC_REPORT_TEMPLATE.md
+4. motive_raw_qc.py
 
-Your task is to implement ONLY Layer 1 and Layer 2 from the specification.
+Important hierarchy:
+- PROJECT_SPEC_MOTIVE_QC.md is the master technical plan.
+- motive_raw_qc.py is the current Layer 1–2 implementation foundation.
+- RAW_MOTIVE_MARKER_QC_REPORT_TEMPLATE.md is the target human-readable report shape.
+- CURSOR_PIPELINE_REVIEW_PROMPT_REVISED.md is a refinement guide, not permission to overbuild.
 
-Do not implement Layer 3, Layer 4, or Layer 5 yet.
-Do not implement frame/window quality summaries yet.
-Do not implement artifact/spike detection yet.
-Do not implement BVH validation yet.
-Do not implement final HTML reporting yet.
+Goal:
+Refine the existing Layer 1–2 raw Motive CSV QC pipeline so it becomes a clean, reliable foundation for a concise expert EDA report. Do not expand into a large dashboard or advanced analysis system.
 
-Current implementation scope:
-1. Reliable Motive CSV parser
-2. Metadata extraction
-3. Marker inventory
-4. Labeled vs unlabeled marker classification
-5. XYZ marker triplet validation
-6. Frame continuity validation
-7. Missing-data quantification
-8. Continuous gap detection
-9. Gap severity classification using config.yaml thresholds with ≥ logic
-10. CSV outputs for Layers 1–2
-11. Excel workbook output
-12. Basic text QC summary
-13. Required Layer 2 plots
-14. Jupyter Notebook frontend that imports backend code and runs Layers 1–2 step by step
+Scientific workflow:
+Raw Motive marker XYZ CSV
+→ raw-data QC / EDA only
+→ identify usable, caution, and exclude frames/windows
+→ later preprocess / solve / export BVH in Motive
+→ later analyze processed BVH while excluding or flagging frames/windows identified from raw CSV QC.
 
-Required project structure:
-motive-qc/
-├── PROJECT_SPEC_MOTIVE_QC.md
-├── config.yaml
-├── motive_raw_qc.py
-├── requirements.txt
-├── notebooks/
-│   └── 01_raw_csv_qc_layers_1_2.ipynb
-├── data/
-│   └── input_csv_here.csv
-├── outputs/
-│   └── generated_by_script/
-└── docs/
-    └── notes/
+Critical wording:
+- Do not call BVH raw data.
+- Do not treat position + quaternion data as raw marker XYZ.
+- The raw CSV is the QC evidence source.
+- BVH is the later processed/skeleton-solved analysis representation.
+- The QC pipeline must detect, label, report, and create masks only.
+- Do not gap-fill, smooth, interpolate, filter, relabel, delete frames, delete markers, or transform coordinates.
 
-Backend/frontend rule:
-All heavy lifting, parsing, validation, calculations, and file writing must live in Python backend code.
-The Jupyter Notebook must only import backend functions, run them step by step, display tables/plots, and allow researcher validation.
+Current code review conclusion:
+motive_raw_qc.py is a good Layer 1–2 foundation, but not yet a stable core. It is close, but fix key issues before adding artifact screening, BVH parsing, or advanced window logic.
 
-Required output files for Layers 1–2:
-outputs/generated_by_script/
-├── tables/
-│   ├── session_summary.csv
-│   ├── marker_inventory.csv
-│   ├── marker_quality_summary.csv
-│   ├── gap_events.csv
-│   ├── gap_summary_by_marker.csv
-│   └── gap_summary_by_group.csv
-├── plots/
-│   ├── marker_completeness.png
-│   ├── gap_duration_histogram.png
-│   └── missing_data_heatmap_labeled.png
-├── qc_report_summary.txt
-├── qc_report.xlsx
-└── config_used.yaml
+Known review verdict:
+- Dynamic parsing: mostly good, but still somewhat fragile.
+- Marker XYZ detection: mostly correct, but duplicate-axis detection needs fixing.
+- Labeled/unlabeled separation: good for common names, but should be more robust.
+- Gap duration logic: mostly correct; inclusive frames and >= thresholds are implemented.
+- Output alignment with minimal report: partial, not complete.
+- Code complexity: reasonable, not overbuilt.
+- Silent dropping/mutation risk: some silent conversions/drops need fixing.
+- Ready as core: almost, but fix key issues first.
 
-The Excel workbook must contain at least these sheets:
-- session_summary
-- marker_inventory
-- marker_quality_summary
-- gap_events
-- gap_summary_by_marker
-- gap_summary_by_group
-- config_used
+Your task now:
+First review the code and propose the exact minimal changes needed. Then implement only the approved Layer 1–2 refinements listed below.
 
-The script must be runnable from command line:
-python motive_raw_qc.py --config config.yaml
+Implement now:
+1. Make parser validation safer:
+   - verify true XYZ triplets per marker;
+   - fix duplicate-axis / duplicate-marker detection;
+   - avoid silently skipping suspicious marker columns;
+   - report excluded non-marker/solved/quaternion columns clearly.
+2. Improve labeled/unlabeled robustness:
+   - support common unlabeled marker naming variants;
+   - keep unlabeled markers in inventory;
+   - summarize unlabeled separately from labeled markers.
+3. Add compact unlabeled-marker burden outputs:
+   - unlabeled_marker_summary.csv
+   - optionally unlabeled_frame_counts.csv if simple and useful.
+4. Add initial frame_qc_mask.csv:
+   - one row per raw CSV frame;
+   - include frame, time, missing_labeled_count, missing_labeled_percent, large_gap_present, moderate_gap_present, unlabeled_present, unlabeled_count, qc_status, reason_codes.
+   - Use only raw CSV QC evidence.
+   - Do not create bvh_frame_qc_mask yet unless mapping fields are clearly configured.
+5. Align outputs with RAW_MOTIVE_MARKER_QC_REPORT_TEMPLATE.md:
+   - session identity;
+   - marker completeness and gaps;
+   - unlabeled-marker burden;
+   - initial BVH-analysis mask structure.
+   - Artifact section can remain “not implemented in this layer.”
+6. Keep the output set lean.
 
-The notebook must be runnable cell by cell and must:
-- load the config
-- run parser/metadata validation
-- show session_summary
-- show marker_inventory
-- run missingness/gap detection
-- show marker_quality_summary
-- show longest gaps from gap_events
-- display the generated plots
-- stop with a clear validation checklist for the researcher
+Required first-pass outputs:
+Tables:
+- session_summary.csv
+- marker_inventory.csv
+- marker_quality_summary.csv
+- gap_events.csv
+- gap_summary_by_group.csv
+- unlabeled_marker_summary.csv
+- frame_qc_mask.csv
+- qc_report.xlsx
+- qc_report_summary.md or qc_report_summary.txt
+- config_used.yaml
 
-Config requirements:
-Create or update config.yaml with tunable settings for:
-- input_csv
-- output_dir
-- project/session metadata
-- frame rate override and inference
-- gap thresholds in seconds: 0.025, 0.1, 0.2, 0.5, 1.0
-- use_greater_equal_thresholds: true
-- unlabeled marker handling
-- marker grouping keywords
-- Excel output settings
-- plot settings
+Plots:
+- missing_data_heatmap_labeled.png
+- marker_completeness.png
+- gap_duration_histogram.png
+- gap_timeline.png
+- unlabeled_count_over_time.png
 
-Strict validation behavior:
-No silent failures.
-If parsing assumptions fail, raise a clear exception.
-If frame numbers are missing or discontinuous, raise or flag according to config.
-If XYZ triplets cannot be identified reliably, stop and explain why.
-If metadata frame rate is missing and no config override is provided, stop and explain why.
-If output files cannot be written, stop and explain why.
-Do not silently drop markers, columns, or frames.
+Do not implement yet:
+- full artifact candidate screening;
+- velocity/acceleration outlier plots;
+- artifact_summary_by_marker.csv;
+- full window_quality_summary.csv;
+- BVH parsing;
+- BVH validation;
+- post-processing distortion checks;
+- HTML report;
+- PCA/jPCA analysis;
+- methods-text generation;
+- automatic exclusion decisions.
 
-Scientific language constraints:
-Do not say the data are “guaranteed raw.”
-Use wording like “consistent with raw Motive marker XYZ export.”
-Do not treat BVH as raw marker data.
-Do not treat rigid bodies, skeletons, quaternions, or constraints as raw marker trajectories.
-Artifact detection is out of scope for this version and must not be implemented yet.
+Also update PROJECT_SPEC_MOTIVE_QC.md:
+Add a short section called “Target Minimal QC Report” explaining:
+- the final human-readable report should follow RAW_MOTIVE_MARKER_QC_REPORT_TEMPLATE.md;
+- the report should be concise, not exhaustive;
+- it should contain only high-value sections: session identity, gap structure, unlabeled burden, candidate artifact screening, and BVH mask;
+- the first implementation does not need to fully populate artifact or BVH sections yet;
+- Layer 1–2 should generate the fields needed for sections 1–3 and prepare the structure for section 5.
 
-After implementation:
-1. Summarize exactly which files were created or modified.
-2. Summarize how to run the command-line script.
-3. Summarize how to run the notebook.
-4. List the validation checks implemented.
-5. Stop. Do not proceed to Layer 3.
+Before coding:
+1. Briefly summarize what you found in the current code.
+2. List the exact files you will edit.
+3. List the outputs you will add or remove.
+4. Confirm that you will not implement postponed layers.
+
+After coding:
+1. Summarize changes.
+2. Explain how to run the script.
+3. List generated outputs.
+4. State what still belongs to later layers.
