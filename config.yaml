@@ -1,0 +1,167 @@
+project:
+  project_name: "Motive raw marker QC"
+  subject_id: "671"
+  session_id: "T2_P1_R1"
+  motive_version: "Motive:Body 3.4.0.2"
+  analysis_stage: "raw_csv_before_preprocessing"
+  notes: "Raw marker XYZ export before Motive gap filling, smoothing, skeleton solving, or BVH export."
+
+paths:
+  input_csv: "data/671_T2_P1_R1_Take 2026-01-15 04.35.25 PM_005_raw test.csv"
+  output_dir: "outputs/generated_by_script"
+
+time:
+  infer_frame_rate_from_file: true
+  frame_rate_hz_override: null
+  require_capture_export_rate_match: true
+  allow_time_column_tolerance_seconds: 0.0005
+
+parsing:
+  require_marker_xyz_triplets: true
+  accepted_marker_types:
+    - "Marker"
+  fail_on_duplicate_marker_names: true
+  fail_on_missing_xyz_axis: true
+  fail_on_non_numeric_coordinate_values: false
+  convert_blank_cells_to_nan: true
+  preserve_raw_frame_numbers: true
+  fail_on_duplicate_frames: true
+  fail_on_non_monotonic_frames: true
+  fail_on_missing_frames: false
+
+markers:
+  include_labeled_markers: true
+  include_unlabeled_markers: true
+  include_unlabeled_in_master_tables: true
+  summarize_unlabeled_separately: true
+  include_unlabeled_in_session_missing_percent: false
+  exclude_markers: []
+  include_only_markers: []
+
+marker_groups:
+  head_neck:
+    keywords: ["Head", "Neck"]
+  torso_chest_back:
+    keywords: ["Chest", "Back", "Sternum", "Spine"]
+  pelvis_waist:
+    keywords: ["Waist", "Pelvis", "Hip", "Sacrum"]
+  shoulder_upper_arm:
+    keywords: ["Shoulder", "UpperArm", "Arm"]
+  elbow_forearm:
+    keywords: ["Elbow", "Forearm"]
+  wrist_hand:
+    keywords: ["Wrist", "Hand"]
+  fingers:
+    keywords: ["Thumb", "Index", "Pinky", "Finger"]
+  thigh_knee:
+    keywords: ["Thigh", "Knee"]
+  shank_ankle:
+    keywords: ["Shin", "Shank", "Ankle"]
+  foot:
+    keywords: ["Heel", "Toe", "Foot"]
+  unlabeled:
+    keywords: ["Unlabeled"]
+  unclassified:
+    keywords: []
+
+gaps:
+  use_greater_equal_thresholds: true
+  report_all_gaps: true
+  report_single_frame_gaps: true
+  thresholds_seconds:
+    any_gap: 0.0
+    tiny_gap: 0.025
+    minor_gap: 0.100
+    moderate_gap: 0.200
+    large_gap: 0.500
+    severe_gap: 1.000
+  primary_report_thresholds_seconds: [0.1, 0.2, 0.5, 1.0]
+
+quality_labels:
+  marker:
+    clean:
+      max_missing_percent: 1.0
+      max_large_gaps: 0
+    minor_issue:
+      max_missing_percent: 5.0
+      max_large_gaps: 0
+    caution:
+      max_missing_percent: 10.0
+      max_large_gaps: 1
+    poor:
+      missing_percent_above: 10.0
+      large_gaps_above: 1
+  session:
+    acceptable_for_preprocessing:
+      max_labeled_missing_percent: 5.0
+      max_large_gaps_labeled: 0
+    caution_for_preprocessing:
+      max_labeled_missing_percent: 10.0
+      max_large_gaps_labeled: 2
+
+frame_quality:
+  enabled: false
+  missing_marker_percent_warn: 5.0
+  missing_marker_percent_caution: 10.0
+  missing_marker_percent_bad: 20.0
+  critical_groups:
+    - torso_chest_back
+    - pelvis_waist
+    - head_neck
+    - thigh_knee
+    - shank_ankle
+    - foot
+
+windows:
+  enabled: false
+  window_lengths_seconds: [0.5, 1.0]
+  use_non_overlapping_windows: true
+  step_seconds: null
+  flag_if_gap_at_least_seconds: 0.2
+  flag_if_large_gap_at_least_seconds: 0.5
+  flag_if_missing_marker_percent_above: 10.0
+
+artifacts:
+  enabled: false
+  methods:
+    velocity_mad: true
+    acceleration_mad: true
+    single_frame_spike: true
+    constant_position_hold: true
+  velocity_mad_multiplier: 8.0
+  acceleration_mad_multiplier: 8.0
+  velocity_percentile_threshold: 99.9
+  acceleration_percentile_threshold: 99.9
+  minimum_valid_neighbors: 2
+  single_frame_spike:
+    return_near_original_tolerance_m: 0.005
+    min_jump_distance_m: 0.050
+  constant_position_hold:
+    min_repeated_frames: 3
+    tolerance_m: 0.000001
+
+outputs:
+  write_csv_tables: true
+  write_excel_workbook: true
+  write_text_summary: true
+  write_html_report: false
+  write_config_used: true
+  plots:
+    enabled: true
+    marker_completeness: true
+    gap_duration_histogram: true
+    missing_data_heatmap_labeled: true
+    missing_data_heatmap_unlabeled: true
+    gap_timeline: false
+    artifact_timeline: false
+    window_quality_timeline: false
+  plot_format: "png"
+  dpi: 300
+  max_markers_per_heatmap: 80
+  heatmap_downsample_max_frames: 5000
+
+reporting:
+  top_n_problem_markers: 20
+  top_n_longest_gaps: 20
+  include_methods_notes_stub: false
+  stop_after_layer: 2
