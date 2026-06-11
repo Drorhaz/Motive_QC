@@ -8,7 +8,8 @@ project:
 
 paths:
   input_csv: "data/671_T2_P1_R1_Take 2026-01-15 04.35.25 PM_005_raw test.csv"
-  output_dir: "outputs/generated_by_script"
+  output_dir: "outputs/runs"
+  use_timestamp_subfolder: true
 
 time:
   infer_frame_rate_from_file: true
@@ -35,6 +36,7 @@ markers:
   include_unlabeled_in_master_tables: true
   summarize_unlabeled_separately: true
   include_unlabeled_in_session_missing_percent: false
+  unlabeled_name_patterns: []
   exclude_markers: []
   include_only_markers: []
 
@@ -94,13 +96,29 @@ quality_labels:
   session:
     acceptable_for_preprocessing:
       max_labeled_missing_percent: 5.0
+      max_union_gap_seconds_ge_0p2: 5.0
+      max_critical_single_gap_seconds: 1.0
       max_large_gaps_labeled: 0
     caution_for_preprocessing:
       max_labeled_missing_percent: 10.0
+      max_union_gap_seconds_ge_0p2: 10.0
+      max_critical_single_gap_seconds: 5.0
       max_large_gaps_labeled: 2
+    poor_if:
+      missing_percent_above: 10.0
+      union_gap_seconds_ge_0p2_above: 10.0
+      critical_single_gap_seconds_above: 5.0
+
+frame_qc_mask:
+  enabled: true
+  caution_missing_labeled_percent: 10.0
+  exclude_missing_labeled_percent: 20.0
+  flag_moderate_gap: true
+  flag_large_gap: true
+  flag_unlabeled_present: false
 
 frame_quality:
-  enabled: false
+  enabled: true
   missing_marker_percent_warn: 5.0
   missing_marker_percent_caution: 10.0
   missing_marker_percent_bad: 20.0
@@ -113,7 +131,7 @@ frame_quality:
     - foot
 
 windows:
-  enabled: false
+  enabled: true
   window_lengths_seconds: [0.5, 1.0]
   use_non_overlapping_windows: true
   step_seconds: null
@@ -122,28 +140,46 @@ windows:
   flag_if_missing_marker_percent_above: 10.0
 
 artifacts:
-  enabled: false
+  enabled: true
+  require_known_units: true
+  max_frames_after_gap_for_velocity: 0
+  # Tuned for expressive movement (e.g. Gaga): flag only extreme kinematic outliers.
   methods:
     velocity_mad: true
-    acceleration_mad: true
+    acceleration_mad: false
     single_frame_spike: true
-    constant_position_hold: true
-  velocity_mad_multiplier: 8.0
-  acceleration_mad_multiplier: 8.0
-  velocity_percentile_threshold: 99.9
-  acceleration_percentile_threshold: 99.9
+    constant_position_hold: false
+  velocity_mad_multiplier: 11.0
+  acceleration_mad_multiplier: 11.0
+  velocity_percentile_threshold: 99.97
+  acceleration_percentile_threshold: 99.97
   minimum_valid_neighbors: 2
   single_frame_spike:
     return_near_original_tolerance_m: 0.005
-    min_jump_distance_m: 0.050
+    min_jump_distance_m: 0.10
   constant_position_hold:
-    min_repeated_frames: 3
+    min_repeated_frames: 5
     tolerance_m: 0.000001
 
+spectral_screen:
+  enabled: false
+  require_known_units: true
+  min_segment_frames: 60
+  hf_band_hz: [15, 60]
+  rolloff_percentile: 95
+  movement_band_hz: [0.5, 12]
+  smoothing_suspicion:
+    hf_power_ratio_threshold: 0.02
+    peer_zscore_threshold: 2.5
+
 outputs:
+  tier: essential
   write_csv_tables: true
   write_excel_workbook: true
   write_text_summary: true
+  write_duplicate_summary_md: false
+  write_frame_level_artifacts: false
+  write_unlabeled_frame_counts: true
   write_html_report: false
   write_config_used: true
   plots:
@@ -151,10 +187,16 @@ outputs:
     marker_completeness: true
     gap_duration_histogram: true
     missing_data_heatmap_labeled: true
-    missing_data_heatmap_unlabeled: true
-    gap_timeline: false
-    artifact_timeline: false
-    window_quality_timeline: false
+    missing_data_heatmap_unlabeled: false
+    gap_timeline: true
+    unlabeled_count_over_time: true
+    labeled_missing_count_over_time: true
+    artifact_timeline: true
+    artifact_velocity_histogram: true
+    window_quality_timeline: true
+    frame_missingness_timeline: true
+    gap_timeline_by_group: true
+    session_psd_summary: true
   plot_format: "png"
   dpi: 300
   max_markers_per_heatmap: 80
@@ -164,4 +206,4 @@ reporting:
   top_n_problem_markers: 20
   top_n_longest_gaps: 20
   include_methods_notes_stub: false
-  stop_after_layer: 2
+  stop_after_layer: 5
