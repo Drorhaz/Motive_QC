@@ -70,6 +70,27 @@ def parse_subject_prefix(marker_name: str) -> tuple[str | None, str]:
     return None, marker_name
 
 
+def parse_marker_identity(marker_name: str) -> tuple[str, str]:
+    """Return ``(skeleton_prefix, canonical_short_name)`` for duplicate-skeleton logic.
+
+    Handles Motive export naming variants in one file, e.g.::
+
+        671:BackLeft        -> ('671', 'BackLeft')
+        T3_671:LThighFront  -> ('T3_671', 'LThighFront')
+        FKA-671_BackLeft    -> ('FKA-671', 'BackLeft')
+    """
+    name = marker_name.strip()
+    if ":" in name:
+        skel, short = name.split(":", 1)
+        return skel.strip(), short.strip()
+    if "_" in name:
+        skel, short = name.split("_", 1)
+        skel, short = skel.strip(), short.strip()
+        if short and short[0].isupper() and not short.lower().startswith("unlabeled"):
+            return skel, short
+    return "", name
+
+
 def is_unlabeled_marker(name: str, config: dict[str, Any] | None = None) -> bool:
     short_name = parse_subject_prefix(name.strip())[1].strip()
     if re.match(r"(?i)^unlabeled(?:[\s_]*\d+)?$", short_name):
@@ -187,10 +208,13 @@ def build_marker_columns(
 
         if marker_name not in markers:
             prefix, short_name = parse_subject_prefix(marker_name)
+            skeleton_prefix, canonical_short_name = parse_marker_identity(marker_name)
             is_unlabeled = is_unlabeled_marker(marker_name, config)
             markers[marker_name] = {
                 "marker_name": marker_name,
                 "marker_short_name": short_name,
+                "skeleton_prefix": skeleton_prefix,
+                "canonical_short_name": canonical_short_name,
                 "subject_or_asset_prefix": prefix,
                 "is_labeled": not is_unlabeled,
                 "is_unlabeled": is_unlabeled,
@@ -223,6 +247,8 @@ def build_marker_columns(
             {
                 "marker_name": marker_name,
                 "marker_short_name": info["marker_short_name"],
+                "skeleton_prefix": info["skeleton_prefix"],
+                "canonical_short_name": info["canonical_short_name"],
                 "subject_or_asset_prefix": info["subject_or_asset_prefix"],
                 "is_labeled": info["is_labeled"],
                 "is_unlabeled": info["is_unlabeled"],

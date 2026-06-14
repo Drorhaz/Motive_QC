@@ -8,6 +8,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from motive_qc.analysis_scope import (
+    analysis_labeled_marker_names,
+    body_group_excluded,
+)
 from motive_qc.core import LOGGER, MotiveSession, QCMessage, QCResult
 from motive_qc.plots import (
     plot_artifact_events_timeline,
@@ -26,6 +30,225 @@ from motive_qc.segments import (
 
 def _artifacts_config(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("artifacts", {})
+
+
+def velocity_mad_sigma(config: dict[str, Any]) -> float:
+    """MAD multiplier (σ) used for Layer 4 velocity artifact detection."""
+    return float(_artifacts_config(config).get("velocity_mad_multiplier", 11.0))
+
+
+def velocity_percentile_threshold(config: dict[str, Any]) -> float:
+    """Percentile floor paired with MAD in Layer 4 velocity artifact detection."""
+    return float(_artifacts_config(config).get("velocity_percentile_threshold", 99.97))
+
+
+def artifact_candidate_severity_note(config: dict[str, Any]) -> str:
+    """Human-readable explanation of artifact heatmap severity colors."""
+    art_cfg = _artifacts_config(config)
+    sigma = velocity_mad_sigma(config)
+    seg_pct = float(art_cfg.get("rigid_body", {}).get("max_segment_length_change_pct", 18.0))
+    return (
+        f"Each cell is the strongest artifact candidate on that marker at that time. "
+        f"Velocity/acceleration MAD (σ={sigma:g}): <strong>minor</strong> = metric 1.0–1.25× "
+        f"threshold, <strong>moderate</strong> = 1.25–2.0×, <strong>severe</strong> = ≥2.0×. "
+        f"Constant-hold and single-frame-spike candidates use the same ratio tiers on their "
+        f"respective metrics. <strong>Segment swap</strong> (rigid-body pair length): "
+        f"<strong>moderate</strong> = distance deviates &gt;{seg_pct:g}% from the session "
+        f"median, <strong>severe/swap</strong> = deviation ≥50% (likely marker identity error). "
+        f"When several methods fire on the same frame, the highest severity is shown."
+    )
+
+
+def _load_marker_pair_map(config: dict[str, Any]) -> pd.DataFrame | None:
+    """Load config/marker_pair_map.csv if present (declared rigid-body pairs)."""
+    from motive_qc.core import base_dir_from_config
+
+    rb_cfg = _artifacts_config(config).get("rigid_body", {})
+    rel = rb_cfg.get("marker_pair_map", "config/marker_pair_map.csv")
+    try:
+        path = base_dir_from_config(config) / rel
+    except Exception:
+        path = Path(rel)
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    if "include_in_qc" in df.columns:
+        df = df[df["include_in_qc"].astype(str).str.lower().isin({"true", "1", "yes"})]
+    return df
+
+
+def _bootstrap_marker_pairs(
+    session: MotiveSession,
+    config: dict[str, Any],
+    marker_names: list[str],
+    name_to_idx: dict[str, int],
+    coords: np.ndarray,
+    max_pair_distance_m: float,
+) -> list[tuple[str, str, str, str]]:
+    """Auto-pair in-analysis labeled markers within each body region by proximity.
+
+    Pairs every in-group marker pair whose robust (median) separation is finite and
+    within ``max_pair_distance_m`` -- a reasonable rigid-body proxy when no explicit
+    marker_pair_map.csv is provided.
+    """
+    inv = session.marker_inventory
+    rb_cfg = _artifacts_config(config).get("rigid_body", {})
+    # A rigid pair has a near-constant separation. Use std/mean (penalizes
+    # movement excursions, unlike MAD) and pair each marker only with its single
+    # most-rigid SAME-SIDE in-group partner. This rejects cross-body pairs
+    # (e.g. LHeel-RHeel) and intermittent-movement pairs that would otherwise
+    # flood the swap flag with false positives.
+    max_cv = float(rb_cfg.get("max_rigid_cv", 0.05))
+    labeled = set(analysis_labeled_marker_names(inv, config))
+    sub = inv[inv["marker_name"].isin(labeled)]
+    seen: set[tuple[str, str]] = set()
+    pairs: list[tuple[str, str, str, str]] = []
+    for region, grp in sub.groupby("body_region_group"):
+        names = [m for m in grp["marker_name"] if m in name_to_idx]
+        for a in names:
+            best_b, best_cv = None, max_cv
+            for b in names:
+                if b == a or _marker_side(b) != _marker_side(a):
+                    continue
+                dist = np.linalg.norm(
+                    coords[:, name_to_idx[a], :] - coords[:, name_to_idx[b], :], axis=1
+                )
+                mean = float(np.nanmean(dist))
+                if not np.isfinite(mean) or mean <= 0 or mean > max_pair_distance_m:
+                    continue
+                cv = float(np.nanstd(dist)) / mean
+                if cv < best_cv:
+                    best_cv, best_b = cv, b
+            if best_b is None:
+                continue
+            key = tuple(sorted((a, best_b)))
+            if key in seen:
+                continue
+            seen.add(key)
+            short_a, short_b = key[0].split(":")[-1], key[1].split(":")[-1]
+            pairs.append((f"{short_a}__{short_b}", key[0], key[1], str(region)))
+    return pairs
+
+
+def _marker_side(marker_name: str) -> str:
+    """Best-effort body side from a marker name: 'L', 'R', or '' (midline)."""
+    short = marker_name.split(":")[-1]
+    low = short.lower()
+    if low.startswith("l") and len(short) > 1 and short[1].isupper():
+        return "L"
+    if low.startswith("r") and len(short) > 1 and short[1].isupper():
+        return "R"
+    if "left" in low:
+        return "L"
+    if "right" in low:
+        return "R"
+    return ""
+
+
+def detect_segment_length_violations(
+    session: MotiveSession,
+    config: dict[str, Any],
+    gap_events: pd.DataFrame,
+    candidate_id_start: int = 0,
+) -> tuple[list[dict[str, Any]], pd.DataFrame]:
+    """Vectorized rigid-body distance (marker-swap) check.
+
+    For each declared/auto pair compute frame-wise Euclidean distance with one
+    ``np.linalg.norm`` call, establish a robust ``np.nanmedian`` baseline (gaps
+    ignored), and flag frames deviating beyond ``max_segment_length_change_pct``
+    even when velocity is sub-sigma. No per-frame Python loops.
+    """
+    rb_cfg = _artifacts_config(config).get("rigid_body", {})
+    empty_qc = pd.DataFrame(
+        columns=[
+            "pair_name",
+            "marker_a",
+            "marker_b",
+            "body_region_group",
+            "median_distance_m",
+            "n_frames_violating",
+            "pct_frames_violating",
+            "n_events",
+        ]
+    )
+    if not rb_cfg.get("enabled", True):
+        return [], empty_qc
+
+    marker_names = list(session.coordinates.coords["marker"].values)
+    name_to_idx = {m: i for i, m in enumerate(marker_names)}
+    coords = session.coordinates.values  # (n_frames, n_markers, 3)
+    frames = session.coordinates.coords["frame"].values
+    times = session.time_seconds.values
+
+    pair_map = _load_marker_pair_map(config)
+    max_pair_distance_m = float(rb_cfg.get("max_pair_distance_m", 0.5))
+    pairs: list[tuple[str, str, str, str]] = []
+    if pair_map is not None and not pair_map.empty:
+        inv = session.marker_inventory.set_index("marker_name")
+        for _, r in pair_map.iterrows():
+            a, b = str(r.get("marker_a")), str(r.get("marker_b"))
+            if a in name_to_idx and b in name_to_idx:
+                region = (
+                    inv.loc[a, "body_region_group"] if a in inv.index else r.get("body_region", "")
+                )
+                pairs.append((str(r.get("pair_name", f"{a}__{b}")), a, b, str(region)))
+    else:
+        pairs = _bootstrap_marker_pairs(
+            session, config, marker_names, name_to_idx, coords, max_pair_distance_m
+        )
+
+    max_change = float(rb_cfg.get("max_segment_length_change_pct", 18.0)) / 100.0
+    candidates: list[dict[str, Any]] = []
+    qc_rows: list[dict[str, Any]] = []
+    candidate_id = candidate_id_start
+
+    for pair_name, a, b, region in pairs:
+        pa = coords[:, name_to_idx[a], :]
+        pb = coords[:, name_to_idx[b], :]
+        dist = np.linalg.norm(pa - pb, axis=1)
+        median = float(np.nanmedian(dist))
+        if not np.isfinite(median) or median <= 0:
+            continue
+        deviation = np.abs(dist - median) / median
+        violating = np.isfinite(dist) & (deviation > max_change)
+        viol_idx = np.where(violating)[0]
+        qc_rows.append(
+            {
+                "pair_name": pair_name,
+                "marker_a": a,
+                "marker_b": b,
+                "body_region_group": region,
+                "median_distance_m": round(median, 6),
+                "n_frames_violating": int(viol_idx.size),
+                "pct_frames_violating": round(
+                    100.0 * viol_idx.size / len(dist), 6
+                )
+                if len(dist)
+                else 0.0,
+                "n_events": 0,
+            }
+        )
+        for idx in viol_idx:
+            candidate_id += 1
+            ratio = 1.0 + float(deviation[idx])
+            severity = "severe" if deviation[idx] >= 0.5 else "moderate"
+            candidates.append(
+                {
+                    "candidate_id": f"C{candidate_id:06d}",
+                    "marker_name": pair_name,
+                    "body_region_group": region,
+                    "frame": int(frames[idx]),
+                    "time_seconds": round(float(times[idx]), 6),
+                    "method": "segment_length_violation",
+                    "severity": severity,
+                    "metric_value": round(float(dist[idx]), 6),
+                    "threshold": round(median, 6),
+                    "near_gap": False,
+                    "recommended_status": "manual_review",
+                }
+            )
+    qc_df = pd.DataFrame(qc_rows) if qc_rows else empty_qc
+    return candidates, qc_df
 
 
 def _detect_constant_holds(
@@ -343,22 +566,17 @@ def cluster_artifact_events(
     for (marker, method), group in candidates.sort_values("frame").groupby(
         ["marker_name", "method"], sort=False
     ):
-        frames = group["frame"].astype(int).tolist()
-        chunk_start = frames[0]
-        prev = frames[0]
-        chunk = group.iloc[[0]]
-        for i in range(1, len(frames)):
-            if frames[i] == prev + 1:
-                prev = frames[i]
-                chunk = pd.concat([chunk, group.iloc[[i]]])
-                continue
-            row, event_id = _flush_chunk(marker, method, chunk_start, prev, chunk, event_id)
-            events.append(row)
-            chunk_start = frames[i]
-            prev = frames[i]
-            chunk = group.iloc[[i]]
-        row, event_id = _flush_chunk(marker, method, chunk_start, prev, chunk, event_id)
-        events.append(row)
+        g = group.reset_index(drop=True)
+        frames = g["frame"].astype(int).to_numpy()
+        run_start = 0
+        for i in range(1, len(frames) + 1):
+            if i == len(frames) or frames[i] != frames[i - 1] + 1:
+                chunk = g.iloc[run_start:i]
+                row, event_id = _flush_chunk(
+                    marker, method, int(frames[run_start]), int(frames[i - 1]), chunk, event_id
+                )
+                events.append(row)
+                run_start = i
 
     events_df = pd.DataFrame(events)
     vel_frames = set(
@@ -442,13 +660,20 @@ def build_artifact_session_summary(
 UNLABELED_BODY_GROUP = "unlabeled"
 
 
-def list_velocity_histogram_groups(session: MotiveSession) -> list[str]:
+def list_velocity_histogram_groups(
+    session: MotiveSession, config: dict[str, Any] | None = None
+) -> list[str]:
     """Body-region groups for per-segment velocity histograms (labeled markers only)."""
     inv = session.marker_inventory
+    excluded = set()
+    if config:
+        from motive_qc.analysis_scope import excluded_body_groups
+
+        excluded = excluded_body_groups(config)
     groups = sorted(
         g
         for g in inv.loc[inv["is_labeled"], "body_region_group"].unique()
-        if g and str(g) != UNLABELED_BODY_GROUP
+        if g and str(g) != UNLABELED_BODY_GROUP and str(g) not in excluded
     )
     return ["all_labeled", *groups]
 
@@ -493,10 +718,17 @@ def collect_session_velocity_distribution(
     vel_pct = float(art_cfg.get("velocity_percentile_threshold", 99.97))
 
     inventory = session.marker_inventory
-    labeled_df = inventory.loc[inventory["is_labeled"]]
     if body_region_group and body_region_group != "all_labeled":
-        labeled_df = labeled_df[labeled_df["body_region_group"] == body_region_group]
-    labeled = labeled_df["marker_name"].tolist()
+        if body_group_excluded(body_region_group, config):
+            labeled: list[str] = []
+        else:
+            labeled = inventory.loc[
+                inventory["is_labeled"]
+                & (inventory["body_region_group"] == body_region_group),
+                "marker_name",
+            ].tolist()
+    else:
+        labeled = analysis_labeled_marker_names(inventory, config)
     all_speeds: list[float] = []
     for marker in labeled:
         for start_idx, end_idx in marker_valid_segments(session, marker):
@@ -560,15 +792,15 @@ def run_layer4_artifacts(
         LOGGER.info("Running Layer 4 artifact candidate screening")
 
     gap_events = layer2_result.tables.get("gap_events", pd.DataFrame())
-    inventory = session.marker_inventory.set_index("marker_name")
-    labeled = inventory[inventory["is_labeled"]].index.tolist()
+    inventory = session.marker_inventory
+    labeled = analysis_labeled_marker_names(inventory, config)
     methods = art_cfg.get("methods", {})
 
     all_candidates: list[dict[str, Any]] = []
     candidate_id = 0
 
     for marker in labeled:
-        inv = inventory.loc[marker]
+        inv = inventory.set_index("marker_name").loc[marker]
         if methods.get("constant_position_hold", True):
             cands, candidate_id = _detect_constant_holds(
                 session, marker, inv, config, candidate_id, gap_events
@@ -585,9 +817,25 @@ def run_layer4_artifacts(
             )
             all_candidates.extend(cands)
 
+    segment_candidates, segment_length_qc = detect_segment_length_violations(
+        session, config, gap_events, candidate_id_start=candidate_id
+    )
+    if segment_candidates:
+        all_candidates.extend(segment_candidates)
+
     artifact_candidates = pd.DataFrame(all_candidates)
     frame_rate = float(session.metadata["effective_frame_rate_hz"])
     artifact_events = cluster_artifact_events(artifact_candidates, frame_rate)
+
+    if not segment_length_qc.empty and not artifact_events.empty:
+        swap_counts = (
+            artifact_events[artifact_events["method"] == "segment_length_violation"]
+            .groupby("marker_name")
+            .size()
+        )
+        segment_length_qc["n_events"] = (
+            segment_length_qc["pair_name"].map(swap_counts).fillna(0).astype(int)
+        )
     artifact_session_summary = build_artifact_session_summary(
         artifact_candidates, artifact_events
     )
@@ -613,7 +861,7 @@ def run_layer4_artifacts(
         figures["artifact_velocity_histogram"] = plot_velocity_artifact_histogram(
             velocity_dist, flagged_speeds, config
         )
-        for group in list_velocity_histogram_groups(session):
+        for group in list_velocity_histogram_groups(session, config):
             if group == "all_labeled":
                 continue
             group_dist = collect_session_velocity_distribution(session, config, group)
@@ -639,9 +887,9 @@ def run_layer4_artifacts(
         "artifact_events": artifact_events,
         "artifact_session_summary": artifact_session_summary,
         "artifact_summary_by_marker": artifact_summary,
+        "artifact_candidates": artifact_candidates,
+        "segment_length_qc": segment_length_qc,
     }
-    if config.get("outputs", {}).get("write_frame_level_artifacts", False):
-        tables["artifact_candidates"] = artifact_candidates
 
     return QCResult(
         layer_name="layer4",

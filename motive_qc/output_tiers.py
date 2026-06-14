@@ -8,16 +8,21 @@ from typing import Any
 
 from motive_qc.core import resolve_path
 
+# Canonical lean per-session output contract. Window-yield / frame-quality tables
+# are demoted to the 'full' (debug) tier; the criterion-tagged qc_mask + the focused
+# gaps/artifacts deliverables replace them as the headline outputs.
 ESSENTIAL_TABLES = frozenset(
     {
         "session_summary",
-        "gap_events",
-        "window_quality_summary",
-        "window_quality_0p5s",
+        "quarantined_markers",
+        "gaps_over_0p5s",
+        "gaps_over_0p2s",
+        "artifacts_by_segment",
+        "segment_length_qc",
         "artifact_events",
         "artifact_session_summary",
-        "qc_intervals",
-        "analysis_mask_summary",
+        "qc_mask",
+        "qc_mask_intervals",
     }
 )
 

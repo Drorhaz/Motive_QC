@@ -27,8 +27,16 @@ from motive_qc.artifacts import (
     list_velocity_histogram_groups,
     run_layer4_artifacts,
 )
+from motive_qc.discovery import apply_session_to_config, discover_sessions
+from motive_qc.batch import BatchResult, run_batch
 from motive_qc.spectral import run_spectral_screen
 from motive_qc.report import run_layer5_report
+from motive_qc.deliverables import (
+    build_artifacts_by_segment,
+    build_gaps_over_threshold,
+    build_qc_mask,
+    load_qc_mask,
+)
 
 __all__ = [
     "__version__",
@@ -49,8 +57,16 @@ __all__ = [
     "list_velocity_histogram_groups",
     "run_spectral_screen",
     "run_layer5_report",
+    "build_gaps_over_threshold",
+    "build_artifacts_by_segment",
+    "build_qc_mask",
+    "load_qc_mask",
     "run_layers_1_2",
     "run_full_pipeline",
+    "discover_sessions",
+    "apply_session_to_config",
+    "run_batch",
+    "BatchResult",
     "write_outputs",
     "write_validation_log",
     "display_layer1_outputs",

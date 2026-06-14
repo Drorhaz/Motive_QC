@@ -12,7 +12,7 @@ import pandas as pd
 import xarray as xr
 import yaml
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 LOGGER = logging.getLogger("motive_raw_qc")
 

@@ -8,7 +8,16 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from motive_qc.analysis_scope import (
+    filter_artifact_events_for_analysis,
+    filter_gap_events_for_analysis,
+)
 from motive_qc.core import QCMessage, QCResult
+from motive_qc.deliverables import (
+    build_artifacts_by_segment,
+    build_gaps_over_threshold,
+    build_qc_mask,
+)
 from motive_qc.marker_meta import is_unlabeled_marker
 from motive_qc.reason_codes import (
     build_reason_codes_markdown,
@@ -24,8 +33,9 @@ def critical_region_large_gaps(gap_events: pd.DataFrame, config: dict[str, Any])
         return False
     critical_groups = config.get("frame_quality", {}).get("critical_groups", [])
     large_thr = config["gaps"]["thresholds_seconds"]["large_gap"]
-    labeled_large = gap_events[
-        gap_events["is_labeled"] & (gap_events["duration_seconds"] >= large_thr)
+    labeled_large = filter_gap_events_for_analysis(gap_events, config)
+    labeled_large = labeled_large[
+        labeled_large["is_labeled"] & (labeled_large["duration_seconds"] >= large_thr)
     ]
     if labeled_large.empty or not critical_groups:
         return False
@@ -76,20 +86,24 @@ def _merge_reasons(existing: str, new: str) -> str:
     return ";".join(dict.fromkeys(parts))
 
 
-def _labeled_gap_events(gap_events: pd.DataFrame) -> pd.DataFrame:
+def _labeled_gap_events(gap_events: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     if gap_events.empty or "is_labeled" not in gap_events.columns:
         return gap_events
-    return gap_events[gap_events["is_labeled"]]
+    gaps = filter_gap_events_for_analysis(gap_events, config)
+    return gaps[gaps["is_labeled"]]
 
 
-def _labeled_artifact_events(artifact_events: pd.DataFrame) -> pd.DataFrame:
+def _labeled_artifact_events(
+    artifact_events: pd.DataFrame, config: dict[str, Any]
+) -> pd.DataFrame:
     if artifact_events.empty:
         return artifact_events
-    if "body_region_group" in artifact_events.columns:
-        return artifact_events[
-            artifact_events["body_region_group"].astype(str) != UNLABELED_BODY_GROUP
+    events = filter_artifact_events_for_analysis(artifact_events, config)
+    if "body_region_group" in events.columns:
+        return events[
+            events["body_region_group"].astype(str) != UNLABELED_BODY_GROUP
         ]
-    return artifact_events
+    return events
 
 
 def _clean_body_groups(groups: str) -> str:
@@ -106,16 +120,17 @@ def _body_groups_for_interval(
     end_frame: int,
     gap_events: pd.DataFrame,
     artifact_events: pd.DataFrame,
+    config: dict[str, Any],
 ) -> str:
     groups: set[str] = set()
-    labeled_gaps = _labeled_gap_events(gap_events)
+    labeled_gaps = _labeled_gap_events(gap_events, config)
     if not labeled_gaps.empty:
         gaps = labeled_gaps[
             (labeled_gaps["gap_end_frame"] >= start_frame)
             & (labeled_gaps["gap_start_frame"] <= end_frame)
         ]
         groups.update(gaps["body_region_group"].astype(str).tolist())
-    labeled_events = _labeled_artifact_events(artifact_events)
+    labeled_events = _labeled_artifact_events(artifact_events, config)
     if not labeled_events.empty:
         ev = labeled_events[
             (labeled_events["end_frame"] >= start_frame)
@@ -131,10 +146,11 @@ def _interval_has_labeled_evidence(
     reason: str,
     n_artifact_events: int,
     gap_events: pd.DataFrame,
+    config: dict[str, Any],
 ) -> bool:
     if n_artifact_events > 0:
         return True
-    labeled_gaps = _labeled_gap_events(gap_events)
+    labeled_gaps = _labeled_gap_events(gap_events, config)
     if not labeled_gaps.empty:
         overlap = labeled_gaps[
             (labeled_gaps["gap_end_frame"] >= start_frame)
@@ -164,7 +180,7 @@ def _finalize_qc_intervals(
     if intervals.empty:
         return intervals
     rows: list[dict[str, Any]] = []
-    labeled_gaps = _labeled_gap_events(gap_events)
+    labeled_gaps = _labeled_gap_events(gap_events, config)
     for _, row in intervals.iterrows():
         dominant = row.get("dominant_gap_marker")
         if dominant is not None and pd.notna(dominant):
@@ -177,6 +193,7 @@ def _finalize_qc_intervals(
             str(row.get("reason", "")),
             int(row.get("n_artifact_events", 0)),
             gap_events,
+            config,
         ):
             continue
         out = row.to_dict()
@@ -238,12 +255,12 @@ def build_qc_intervals(
         status = statuses[start_i]
         action = "review" if status == "caution" else "exclude_from_bvh_analysis"
 
-        labeled_gaps = _labeled_gap_events(gap_events)
+        labeled_gaps = _labeled_gap_events(gap_events, config)
         gaps_in = labeled_gaps[
             (labeled_gaps["gap_end_frame"] >= start_frame)
             & (labeled_gaps["gap_start_frame"] <= end_frame)
         ] if not labeled_gaps.empty else pd.DataFrame()
-        labeled_events = _labeled_artifact_events(artifact_events)
+        labeled_events = _labeled_artifact_events(artifact_events, config)
         ev_in = labeled_events[
             (labeled_events["end_frame"] >= start_frame)
             & (labeled_events["start_frame"] <= end_frame)
@@ -265,7 +282,7 @@ def build_qc_intervals(
                 "primary_reason_code": primary_reason_code(reason),
                 "reason_human": reason_codes_to_human(reason),
                 "affected_body_groups": _body_groups_for_interval(
-                    start_frame, end_frame, gap_events, artifact_events
+                    start_frame, end_frame, gap_events, artifact_events, config
                 ),
                 "n_artifact_events": len(ev_in),
                 "dominant_gap_marker": dominant_gap,
@@ -495,10 +512,31 @@ def run_layer5_report(
     intervals = _finalize_qc_intervals(intervals, gap_events, config)
     mask_summary = build_analysis_mask_summary(analysis_mask)
 
+    thresholds = config["gaps"]["thresholds_seconds"]
+    moderate = float(thresholds["moderate_gap"])
+    large = float(thresholds["large_gap"])
+    duration_s = float(layer1.session.metadata.get("duration_seconds", 0.0))
+
+    gaps_over_0p5s = build_gaps_over_threshold(gap_events, config, large)
+    gaps_over_0p2s = build_gaps_over_threshold(gap_events, config, moderate, upper_seconds=large)
+    artifacts_by_segment = build_artifacts_by_segment(artifact_events, config, duration_s)
+    qc_mask, qc_mask_intervals = build_qc_mask(
+        layer1.session, gap_events, artifact_events, config
+    )
+    segment_length_qc = (
+        layer4.tables.get("segment_length_qc", pd.DataFrame()) if layer4 else pd.DataFrame()
+    )
+
     tables = {
         "analysis_frame_mask": analysis_mask,
         "qc_intervals": intervals,
         "analysis_mask_summary": mask_summary,
+        "gaps_over_0p5s": gaps_over_0p5s,
+        "gaps_over_0p2s": gaps_over_0p2s,
+        "artifacts_by_segment": artifacts_by_segment,
+        "segment_length_qc": segment_length_qc,
+        "qc_mask": qc_mask,
+        "qc_mask_intervals": qc_mask_intervals,
     }
 
     all_messages = list(layer1.messages)

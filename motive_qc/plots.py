@@ -39,7 +39,9 @@ def generate_layer2_plots(
 
   if outputs_cfg["plots"].get("missing_data_heatmap_labeled", True):
     path = plot_dir / f"missing_data_heatmap_labeled.{fmt}"
-    plot_missing_heatmap(session, labeled_only=True, config=config, output_path=path, dpi=dpi)
+    plot_missing_heatmap(
+      session, labeled_only=True, config=config, output_path=path, dpi=dpi, gap_events=gap_events
+    )
     figures["missing_data_heatmap_labeled"] = path
 
   if (
@@ -118,11 +120,16 @@ def plot_missing_heatmap(
   config: dict[str, Any],
   output_path: Path,
   dpi: int,
+  gap_events: pd.DataFrame | None = None,
 ) -> None:
   inventory = session.marker_inventory
   if labeled_only:
-    markers = inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
-    title = "Missing data heatmap (labeled markers)"
+    if "included_in_analysis" in inventory.columns:
+      markers = inventory.loc[inventory["included_in_analysis"].astype(bool), "marker_name"].tolist()
+      title = "Missing data heatmap (in-analysis labeled markers)"
+    else:
+      markers = inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
+      title = "Missing data heatmap (labeled markers)"
   else:
     markers = inventory.loc[inventory["is_unlabeled"], "marker_name"].tolist()
     title = "Missing data heatmap (unlabeled markers)"
@@ -133,29 +140,230 @@ def plot_missing_heatmap(
     plt.close(fig)
     return
 
-  max_markers = config["outputs"].get("max_markers_per_heatmap", 80)
-  markers = markers[:max_markers]
-  valid = session.valid_marker_frame.sel(marker=markers).values
-  missing = (~valid).astype(float)
+  matrix = build_gap_severity_matrix(session, markers, config, gap_events)
   frames = session.coordinates.coords["frame"].values
   max_frames = config["outputs"].get("heatmap_downsample_max_frames", 5000)
   downsample_note = ""
   if len(frames) > max_frames:
     step = int(np.ceil(len(frames) / max_frames))
-    missing = missing[::step, :]
-    frames = frames[::step]
     downsample_note = f" (frames downsampled every {step})"
+  matrix, _ = _downsample_matrix_max(matrix, max_frames)
 
   fig, ax = plt.subplots(figsize=(14, max(4, len(markers) * 0.2)))
-  ax.imshow(missing.T, aspect="auto", interpolation="nearest", cmap="Reds", vmin=0, vmax=1)
+  cmap = plt.cm.colors.ListedColormap(["#ffffff", "#ecc94b", "#e53e3e"])
+  ax.imshow(matrix.T, aspect="auto", interpolation="nearest", cmap=cmap, vmin=0, vmax=2)
   ax.set_xlabel(f"Frame index{downsample_note}")
   ax.set_ylabel("Marker")
   ax.set_yticks(range(len(markers)))
   ax.set_yticklabels(markers, fontsize=7)
   ax.set_title(title + downsample_note)
+  from matplotlib.patches import Patch
+  ax.legend(
+    handles=[
+      Patch(facecolor="#ffffff", edgecolor="#ccc", label="present"),
+      Patch(facecolor="#ecc94b", label="gap 0.2–0.5 s"),
+      Patch(facecolor="#e53e3e", label="gap ≥0.5 s"),
+    ],
+    loc="upper right",
+    fontsize=8,
+  )
   fig.tight_layout()
   fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
   plt.close(fig)
+
+
+def build_gap_severity_matrix(
+  session: MotiveSession,
+  markers: list[str],
+  config: dict[str, Any],
+  gap_events: pd.DataFrame | None = None,
+) -> np.ndarray:
+  """Per-frame per-marker severity: 0=present, 1=moderate gap, 2=large gap."""
+  valid = session.valid_marker_frame.sel(marker=markers).values.astype(bool)
+  n_frames, n_markers = valid.shape
+  matrix = np.zeros((n_frames, n_markers), dtype=np.float32)
+  matrix[~valid] = 1.0
+
+  if gap_events is None:
+    return matrix
+
+  thresholds = config["gaps"]["thresholds_seconds"]
+  moderate = float(thresholds["moderate_gap"])
+  large = float(thresholds["large_gap"])
+  frames = session.coordinates.coords["frame"].values.astype(int)
+  marker_to_idx = {m: i for i, m in enumerate(markers)}
+
+  labeled = gap_events[gap_events["is_labeled"]] if "is_labeled" in gap_events.columns else gap_events
+  for _, g in labeled.iterrows():
+    mk = str(g.get("marker_name", ""))
+    if mk not in marker_to_idx:
+      continue
+    mi = marker_to_idx[mk]
+    dur = float(g["duration_seconds"])
+    if dur < moderate:
+      continue
+    sf, ef = int(g["gap_start_frame"]), int(g["gap_end_frame"])
+    in_gap = (frames >= sf) & (frames <= ef)
+    sev = 2.0 if dur >= large else 1.0
+    matrix[in_gap, mi] = np.maximum(matrix[in_gap, mi], sev)
+  return matrix
+
+
+def _downsample_matrix_max(
+    matrix: np.ndarray,
+    max_frames: int,
+    time_s: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Downsample (frames × markers) by max-pooling along time."""
+    n_frames = matrix.shape[0]
+    if n_frames <= max_frames:
+        return matrix, (np.asarray(time_s, dtype=float) if time_s is not None else None)
+    step = int(np.ceil(n_frames / max_frames))
+    n_new = int(np.ceil(n_frames / step))
+    pooled = np.zeros((n_new, matrix.shape[1]), dtype=matrix.dtype)
+    pooled_time: np.ndarray | None = None
+    if time_s is not None:
+        pooled_time = np.zeros(n_new, dtype=float)
+    for i in range(n_new):
+        chunk = matrix[i * step : (i + 1) * step, :]
+        if chunk.size:
+            pooled[i] = chunk.max(axis=0)
+        if pooled_time is not None:
+            time_chunk = np.asarray(time_s[i * step : (i + 1) * step], dtype=float)
+            if time_chunk.size:
+                pooled_time[i] = float(time_chunk[-1])
+    return pooled, pooled_time
+
+
+def _in_analysis_marker_names(session: MotiveSession) -> list[str]:
+    inventory = session.marker_inventory
+    if "included_in_analysis" in inventory.columns:
+        return inventory.loc[
+            inventory["included_in_analysis"].astype(bool), "marker_name"
+        ].tolist()
+    return inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
+
+
+def build_artifact_candidate_matrix(
+    session: MotiveSession,
+    markers: list[str],
+    artifact_candidates: pd.DataFrame,
+) -> np.ndarray:
+    """Per-frame per-marker artifact severity: 0=none, 1=minor, 2=moderate, 3=severe/swap."""
+    n_frames = len(session.coordinates.coords["frame"])
+    n_markers = len(markers)
+    matrix = np.zeros((n_frames, n_markers), dtype=np.float32)
+    if artifact_candidates.empty or not markers:
+        return matrix
+
+    frames = session.coordinates.coords["frame"].values.astype(int)
+    frame_to_idx = {int(f): i for i, f in enumerate(frames)}
+    marker_to_idx = {m: i for i, m in enumerate(markers)}
+    severity_level = {"minor": 1.0, "moderate": 2.0, "severe": 3.0}
+
+    for _, row in artifact_candidates.iterrows():
+        mk = str(row.get("marker_name", ""))
+        if mk not in marker_to_idx:
+            continue
+        fi = frame_to_idx.get(int(row["frame"]))
+        if fi is None:
+            continue
+        mi = marker_to_idx[mk]
+        method = str(row.get("method", ""))
+        if method == "segment_length_violation":
+            level = severity_level.get(str(row.get("severity", "moderate")), 2.0)
+        else:
+            level = severity_level.get(str(row.get("severity", "minor")), 1.0)
+        matrix[fi, mi] = np.maximum(matrix[fi, mi], level)
+    return matrix
+
+
+def plot_artifact_candidate_heatmap_on_ax(
+    ax: plt.Axes,
+    session: MotiveSession,
+    artifact_candidates: pd.DataFrame,
+    config: dict[str, Any],
+    title: str,
+    *,
+    sigma: float | None = None,
+    show_marker_labels: bool = False,
+) -> None:
+    """Draw artifact-candidate severity heatmap on an existing axes."""
+    markers = _in_analysis_marker_names(session)
+    if not markers:
+        ax.text(0.5, 0.5, "No in-analysis markers", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(title)
+        return
+
+    max_markers = config["outputs"].get("max_markers_per_heatmap", 80)
+    markers = markers[:max_markers]
+    matrix = build_artifact_candidate_matrix(session, markers, artifact_candidates)
+    max_frames = config["outputs"].get("heatmap_downsample_max_frames", 5000)
+    time_s = session.time_seconds.values.astype(float)
+    matrix, time_ds = _downsample_matrix_max(matrix, max_frames, time_s)
+
+    cmap = plt.cm.colors.ListedColormap(["#ffffff", "#feebc8", "#ed8936", "#c53030"])
+    n_cols = matrix.shape[0]
+    if time_ds is not None and len(time_ds) == n_cols and n_cols > 0:
+        t0, t1 = float(time_ds[0]), float(time_ds[-1])
+        if n_cols > 1:
+            half_col = (t1 - t0) / (n_cols - 1) / 2.0
+            t0 -= half_col
+            t1 += half_col
+        extent = [t0, t1, -0.5, len(markers) - 0.5]
+    else:
+        extent = [0, n_cols, -0.5, len(markers) - 0.5]
+    ax.imshow(
+        matrix.T,
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=0,
+        vmax=3,
+        extent=extent,
+        origin="lower",
+    )
+    subtitle = f"MAD σ={sigma:g}" if sigma is not None else "artifact candidates"
+    ax.set_title(f"{title}\n({subtitle})", fontsize=9)
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Marker", fontsize=8)
+    if show_marker_labels:
+        ax.set_yticks(range(len(markers)))
+        ax.set_yticklabels(markers, fontsize=7)
+    else:
+        ax.set_yticks([])
+
+
+def plot_gap_severity_heatmap_on_ax(
+  ax: plt.Axes,
+  session: MotiveSession,
+  gap_events: pd.DataFrame,
+  config: dict[str, Any],
+  title: str,
+) -> None:
+  """Draw a 3-level gap-severity heatmap on an existing axes (batch grid use)."""
+  inventory = session.marker_inventory
+  if "included_in_analysis" in inventory.columns:
+    markers = inventory.loc[inventory["included_in_analysis"].astype(bool), "marker_name"].tolist()
+  else:
+    markers = inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
+  if not markers:
+    ax.text(0.5, 0.5, "No in-analysis markers", ha="center", va="center", transform=ax.transAxes)
+    ax.set_title(title)
+    return
+
+  max_markers = config["outputs"].get("max_markers_per_heatmap", 80)
+  markers = markers[:max_markers]
+  matrix = build_gap_severity_matrix(session, markers, config, gap_events)
+  max_frames = config["outputs"].get("heatmap_downsample_max_frames", 5000)
+  matrix, _ = _downsample_matrix_max(matrix, max_frames)
+
+  cmap = plt.cm.colors.ListedColormap(["#ffffff", "#ecc94b", "#e53e3e"])
+  ax.imshow(matrix.T, aspect="auto", interpolation="nearest", cmap=cmap, vmin=0, vmax=2)
+  ax.set_title(title, fontsize=10)
+  ax.set_xlabel("Frame", fontsize=8)
+  ax.set_ylabel("Marker", fontsize=8)
+  ax.set_yticks([])
 
 
 def plot_gap_timeline(
@@ -473,7 +681,13 @@ def _draw_velocity_artifact_histogram(
     vel_pct = distribution.get("vel_percentile_config", "")
 
     if vel_mad_thr > 0:
-        ax.axvline(vel_mad_thr, color="#2b6cb0", linestyle="--", linewidth=1.2, label="MAD threshold")
+        ax.axvline(
+            vel_mad_thr,
+            color="#2b6cb0",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"MAD threshold (σ={vel_mult})",
+        )
     if vel_pct_thr > 0 and abs(vel_pct_thr - vel_mad_thr) > 1e-9:
         ax.axvline(vel_pct_thr, color="#805ad5", linestyle=":", linewidth=1.2, label="Percentile floor")
     if vel_thr > 0:
@@ -491,7 +705,8 @@ def _draw_velocity_artifact_histogram(
     ax.set_xlabel(f"Marker speed ({units}/s)")
     ax.set_ylabel("Count")
     ax.set_title(
-        f"Velocity artifact histogram — {group_label} ({n_markers} markers)"
+        f"Velocity artifact histogram — {group_label}\n"
+        f"({n_markers} markers · MAD σ={vel_mult} · pct={vel_pct})"
     )
     ax.legend(loc="upper right", fontsize=8)
     n_above = int((speeds >= vel_thr).sum()) if vel_thr > 0 else 0

@@ -7,6 +7,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from motive_qc.analysis_scope import (
+  analysis_labeled_marker_names,
+  analysis_scope_messages,
+  filter_gap_events_for_analysis,
+  filter_marker_quality_for_analysis,
+  marker_excluded_from_analysis,
+)
 from motive_qc.core import LOGGER, MotiveSession, QCMessage, QCResult
 from motive_qc.parse import build_layer1_session_summary
 from motive_qc.plots import generate_layer2_plots
@@ -147,7 +154,7 @@ def detect_gaps_for_marker(
 
 
 def run_layer2_gaps(session: MotiveSession, config: dict[str, Any], verbose: bool = False) -> QCResult:
-  messages = list(session.validation_messages)
+  messages = list(session.validation_messages) + analysis_scope_messages(config)
   frame_rate = float(session.metadata["effective_frame_rate_hz"])
   frames = session.coordinates.coords["frame"].values
   valid_da = session.valid_marker_frame
@@ -161,6 +168,61 @@ def run_layer2_gaps(session: MotiveSession, config: dict[str, Any], verbose: boo
   for marker in session.coordinates.coords["marker"].values:
     valid = valid_da.sel(marker=marker).values.astype(bool)
     inv = inventory.loc[marker]
+    is_labeled = bool(inv["is_labeled"])
+    quarantine_reason = str(inv.get("quarantine_reason", "") or "")
+    if "included_in_analysis" in inv.index:
+      in_analysis = bool(inv["included_in_analysis"])
+    else:
+      in_analysis = is_labeled and not marker_excluded_from_analysis(inv, config)
+    excluded_group = is_labeled and not in_analysis and not quarantine_reason
+
+    # Labeled markers removed from analysis (excluded body group or quarantined
+    # never-solved / duplicate) get a zero-gap summary row and are NOT gap-detected,
+    # so their absence never leaks into labeled missingness, gaps, masks, or windows.
+    if is_labeled and not in_analysis:
+      n_total = len(valid)
+      n_valid = int(valid.sum())
+      n_missing = n_total - n_valid
+      missing_percent = 100.0 * n_missing / n_total if n_total else 0.0
+      if quarantine_reason == "phantom_skeleton":
+        label, reason = "quarantined", "Quarantined: phantom/duplicate skeleton copy."
+      elif quarantine_reason == "never_solved":
+        label, reason = "quarantined", "Quarantined: never-solved marker (>= threshold missing)."
+      elif quarantine_reason == "duplicate_marker_set":
+        label, reason = "quarantined", "Quarantined: phantom/duplicate marker set copy."
+      else:
+        label, reason = "excluded", "Excluded body group from QC analysis scope."
+      marker_rows.append(
+        {
+          "marker_name": marker,
+          "is_labeled": is_labeled,
+          "is_unlabeled": bool(inv["is_unlabeled"]),
+          "included_in_analysis": False,
+          "quarantine_reason": quarantine_reason,
+          "body_region_group": inv["body_region_group"],
+          "n_total_frames": n_total,
+          "n_valid_frames": n_valid,
+          "n_missing_frames": n_missing,
+          "missing_percent": round(missing_percent, 6),
+          "n_gaps_total": 0,
+          "n_single_frame_gaps": 0,
+          "longest_gap_frames": 0,
+          "longest_gap_seconds": 0.0,
+          "mean_gap_frames": None,
+          "median_gap_frames": None,
+          "n_gaps_ge_0p025s": 0,
+          "n_gaps_ge_0p1s": 0,
+          "n_gaps_ge_0p2s": 0,
+          "n_gaps_ge_0p5s": 0,
+          "n_gaps_ge_1p0s": 0,
+          "first_missing_frame": None,
+          "last_missing_frame": None,
+          "quality_label": label,
+          "quality_reason": reason,
+        }
+      )
+      continue
+
     gaps, gap_id = detect_gaps_for_marker(
       valid, frames, frame_rate, marker, inv, config, gap_id
     )
@@ -190,6 +252,8 @@ def run_layer2_gaps(session: MotiveSession, config: dict[str, Any], verbose: boo
         "marker_name": marker,
         "is_labeled": bool(inv["is_labeled"]),
         "is_unlabeled": bool(inv["is_unlabeled"]),
+        "included_in_analysis": in_analysis,
+        "quarantine_reason": quarantine_reason,
         "body_region_group": inv["body_region_group"],
         "n_total_frames": n_total,
         "n_valid_frames": n_valid,
@@ -216,6 +280,29 @@ def run_layer2_gaps(session: MotiveSession, config: dict[str, Any], verbose: boo
   marker_quality_summary = pd.DataFrame(marker_rows)
   gap_events = pd.DataFrame(all_gaps)
 
+  if "quarantine_reason" in marker_quality_summary.columns:
+    quarantined_markers = marker_quality_summary[
+      marker_quality_summary["quarantine_reason"].astype(str).str.len() > 0
+    ][
+      [
+        "marker_name",
+        "body_region_group",
+        "missing_percent",
+        "quarantine_reason",
+        "n_total_frames",
+      ]
+    ].copy()
+  else:
+    quarantined_markers = pd.DataFrame(
+      columns=[
+        "marker_name",
+        "body_region_group",
+        "missing_percent",
+        "quarantine_reason",
+        "n_total_frames",
+      ]
+    )
+
   gap_summary_by_marker = marker_quality_summary[
     [
       "marker_name",
@@ -236,14 +323,18 @@ def run_layer2_gaps(session: MotiveSession, config: dict[str, Any], verbose: boo
     ]
   ].copy()
 
-  gap_summary_by_group = build_gap_summary_by_group(marker_quality_summary, gap_events)
+  analysis_gap_events = filter_gap_events_for_analysis(gap_events, config)
+  gap_summary_by_group = build_gap_summary_by_group(
+    filter_marker_quality_for_analysis(marker_quality_summary, config),
+    analysis_gap_events,
+  )
   session_summary = update_session_summary_layer2(
-    session, marker_quality_summary, gap_events, config
+    session, marker_quality_summary, analysis_gap_events, config
   )
   unlabeled_marker_summary, unlabeled_frame_counts = build_unlabeled_summary(
-    session, gap_events, config
+    session, analysis_gap_events, config
   )
-  frame_qc_mask = build_frame_qc_mask(session, gap_events, config)
+  frame_qc_mask = build_frame_qc_mask(session, analysis_gap_events, config)
 
   figures = generate_layer2_plots(
     session,
@@ -262,6 +353,7 @@ def run_layer2_gaps(session: MotiveSession, config: dict[str, Any], verbose: boo
     "gap_summary_by_marker": gap_summary_by_marker,
     "gap_summary_by_group": gap_summary_by_group,
     "unlabeled_marker_summary": unlabeled_marker_summary,
+    "quarantined_markers": quarantined_markers,
     "frame_qc_mask": frame_qc_mask,
   }
   if config["outputs"].get("write_unlabeled_frame_counts", True):
@@ -337,6 +429,10 @@ def session_gap_timeline_metrics(
   if gap_events.empty or frame_rate <= 0:
     return empty
 
+  gap_events = filter_gap_events_for_analysis(gap_events, config)
+  if gap_events.empty:
+    return empty
+
   labeled_mod = gap_events[
     gap_events["is_labeled"] & (gap_events["duration_seconds"] >= moderate_thr)
   ]
@@ -382,83 +478,112 @@ def session_gap_timeline_metrics(
   }
 
 
+def readiness_config(config: dict[str, Any]) -> dict[str, Any]:
+  defaults = {
+    "min_marker_coverage_pct": 90.0,
+    "sustained_dropout_seconds": 2.0,
+    "caution_missing_percent": 5.0,
+    "poor_missing_percent": 15.0,
+    "caution_pct_time_below_coverage": 10.0,
+    "poor_pct_time_below_coverage": 30.0,
+    "caution_sustained_dropout_markers": 1,
+    "poor_sustained_dropout_markers": 5,
+  }
+  return {**defaults, **config.get("readiness", {})}
+
+
+def compute_coverage_metrics(
+  session: MotiveSession,
+  analysis_markers: pd.DataFrame,
+  config: dict[str, Any],
+) -> dict[str, float]:
+  """Per-frame in-analysis labeled marker coverage and sustained-dropout count.
+
+  Coverage is robust to many markers (it measures the *fraction* present per frame),
+  unlike a union-of-gaps metric which saturates with marker count.
+  """
+  ready = readiness_config(config)
+  min_cov = float(ready["min_marker_coverage_pct"])
+  sustained_s = float(ready["sustained_dropout_seconds"])
+  labeled = analysis_labeled_marker_names(session.marker_inventory, config)
+  n = len(labeled)
+
+  empty = {
+    "labeled_marker_coverage_mean_pct": 100.0 if n == 0 else 0.0,
+    "min_marker_coverage_pct_observed": 100.0 if n == 0 else 0.0,
+    "pct_time_below_coverage": 0.0,
+    "n_markers_sustained_dropout": 0,
+  }
+  if n == 0:
+    return empty
+
+  valid = session.valid_marker_frame.sel(marker=labeled).values
+  present_per_frame = valid.sum(axis=1)
+  coverage_pct = 100.0 * present_per_frame / n
+  pct_below = 100.0 * float(np.mean(coverage_pct < min_cov))
+
+  n_sustained = 0
+  if len(analysis_markers) and "longest_gap_seconds" in analysis_markers.columns:
+    n_sustained = int((analysis_markers["longest_gap_seconds"] >= sustained_s).sum())
+
+  return {
+    "labeled_marker_coverage_mean_pct": round(float(np.mean(coverage_pct)), 6),
+    "min_marker_coverage_pct_observed": round(float(np.min(coverage_pct)), 6),
+    "pct_time_below_coverage": round(pct_below, 6),
+    "n_markers_sustained_dropout": n_sustained,
+  }
+
+
 def evaluate_preprocessing_status(
   missing_percent_labeled: float,
-  gap_metrics: dict[str, float],
+  coverage_metrics: dict[str, float],
   config: dict[str, Any],
 ) -> tuple[str, str]:
-  session_cfg = config["quality_labels"]["session"]
-  acceptable = session_cfg["acceptable_for_preprocessing"]
-  caution = session_cfg["caution_for_preprocessing"]
-  poor_if = session_cfg.get(
-    "poor_if",
-    {
-      "missing_percent_above": 10.0,
-      "union_gap_seconds_ge_0p2_above": 10.0,
-      "critical_single_gap_seconds_above": 5.0,
-    },
-  )
+  """Coverage-based verdict.
 
-  union_s = gap_metrics["union_gap_seconds_ge_0p2"]
-  max_crit_s = gap_metrics["max_critical_gap_seconds"]
-  n_large = int(gap_metrics["n_gaps_ge_0p5"])
-  merged_s = gap_metrics["longest_merged_gap_run_seconds"]
+  Driven by labeled missingness, per-frame coverage, and the number of markers
+  with sustained dropout -- all robust to total marker count. Union-gap time is
+  kept only as an informational metric, not a verdict driver.
+  """
+  ready = readiness_config(config)
+  pct_below = float(coverage_metrics.get("pct_time_below_coverage", 0.0))
+  n_sustained = int(coverage_metrics.get("n_markers_sustained_dropout", 0))
+  min_cov = float(ready["min_marker_coverage_pct"])
 
-  if missing_percent_labeled > poor_if.get("missing_percent_above", 10.0):
-    return (
-      "poor",
-      f"Labeled missingness {missing_percent_labeled}% exceeds poor threshold "
-      f"({poor_if.get('missing_percent_above', 10.0)}%).",
+  poor_drivers: list[str] = []
+  if missing_percent_labeled > float(ready["poor_missing_percent"]):
+    poor_drivers.append(
+      f"labeled missingness {missing_percent_labeled}% > {ready['poor_missing_percent']}%"
     )
-  if union_s >= poor_if.get("union_gap_seconds_ge_0p2_above", 10.0):
-    return (
-      "poor",
-      f"Union labeled gap time (>= moderate) is {union_s}s, at or above poor threshold "
-      f"({poor_if.get('union_gap_seconds_ge_0p2_above', 10.0)}s).",
+  if pct_below > float(ready["poor_pct_time_below_coverage"]):
+    poor_drivers.append(
+      f"{pct_below}% of time below {min_cov}% marker coverage"
     )
-  if max_crit_s >= poor_if.get("critical_single_gap_seconds_above", 5.0):
-    return (
-      "poor",
-      f"Critical-region labeled gap up to {max_crit_s}s exceeds poor threshold "
-      f"({poor_if.get('critical_single_gap_seconds_above', 5.0)}s).",
+  if n_sustained >= int(ready["poor_sustained_dropout_markers"]):
+    poor_drivers.append(
+      f"{n_sustained} markers with sustained dropout "
+      f"(>= {ready['sustained_dropout_seconds']}s)"
     )
+  if poor_drivers:
+    return "poor", "Poor for preprocessing: " + "; ".join(poor_drivers) + "."
 
-  acc_union = acceptable.get("max_union_gap_seconds_ge_0p2", 5.0)
-  acc_crit = acceptable.get("max_critical_single_gap_seconds", 1.0)
-  if (
-    missing_percent_labeled <= acceptable["max_labeled_missing_percent"]
-    and union_s <= acc_union
-    and max_crit_s < acc_crit
-  ):
-    return (
-      "acceptable",
-      "Labeled missingness and timeline gap burden within acceptable preprocessing thresholds.",
-    )
-
-  caut_union = caution.get("max_union_gap_seconds_ge_0p2", 10.0)
-  caut_crit = caution.get("max_critical_single_gap_seconds", 5.0)
-  if (
-    missing_percent_labeled <= caution["max_labeled_missing_percent"]
-    and union_s <= caut_union
-    and max_crit_s < caut_crit
-  ):
-    parts = []
-    if max_crit_s >= acc_crit:
-      parts.append(f"critical-region gap up to {max_crit_s}s")
-    if union_s > acc_union:
-      parts.append(f"union moderate+ gap time {union_s}s")
-    if n_large > 0:
-      parts.append(f"{n_large} labeled gaps >= 0.5s")
-    detail = "; ".join(parts) if parts else "borderline gap metrics"
+  caution_drivers: list[str] = []
+  if missing_percent_labeled > float(ready["caution_missing_percent"]):
+    caution_drivers.append(f"labeled missingness {missing_percent_labeled}%")
+  if pct_below > float(ready["caution_pct_time_below_coverage"]):
+    caution_drivers.append(f"{pct_below}% of time below {min_cov}% coverage")
+  if n_sustained >= int(ready["caution_sustained_dropout_markers"]):
+    caution_drivers.append(f"{n_sustained} marker(s) with sustained dropout")
+  if caution_drivers:
     return (
       "caution",
-      f"Review before preprocessing: {detail} (merged run up to {merged_s}s).",
+      "Review before preprocessing: " + "; ".join(caution_drivers) + ".",
     )
 
   return (
-    "caution",
-    f"Gap metrics require review: union time {union_s}s, max critical gap {max_crit_s}s, "
-    f"{n_large} gaps >= 0.5s.",
+    "acceptable",
+    f"Labeled missingness {missing_percent_labeled}% and marker coverage within "
+    "acceptable thresholds.",
   )
 
 
@@ -469,7 +594,8 @@ def update_session_summary_layer2(
   config: dict[str, Any],
 ) -> pd.DataFrame:
   summary = build_layer1_session_summary(session).iloc[0].to_dict()
-  labeled = marker_quality[marker_quality["is_labeled"]]
+  analysis_markers = filter_marker_quality_for_analysis(marker_quality, config)
+  labeled = analysis_markers
   unlabeled = marker_quality[marker_quality["is_unlabeled"]]
   n_frames = int(session.metadata["total_frames_observed"])
 
@@ -504,7 +630,10 @@ def update_session_summary_layer2(
 
   frame_rate = float(session.metadata["effective_frame_rate_hz"])
   gap_metrics = session_gap_timeline_metrics(gap_events, config, frame_rate)
-  raw_status, raw_reason = evaluate_preprocessing_status(pct_lab, gap_metrics, config)
+  coverage_metrics = compute_coverage_metrics(session, analysis_markers, config)
+  raw_status, raw_reason = evaluate_preprocessing_status(
+    pct_lab, coverage_metrics, config
+  )
 
   summary.update(
     {
@@ -527,6 +656,16 @@ def update_session_summary_layer2(
       "union_gap_seconds_ge_0p2_labeled": gap_metrics["union_gap_seconds_ge_0p2"],
       "longest_merged_gap_run_seconds": gap_metrics["longest_merged_gap_run_seconds"],
       "max_critical_gap_seconds_labeled": gap_metrics["max_critical_gap_seconds"],
+      "n_labeled_markers_in_analysis": int(len(labeled)),
+      "n_quarantined_markers": int(session.metadata.get("n_quarantined_markers", 0)),
+      "labeled_marker_coverage_mean_pct": coverage_metrics[
+        "labeled_marker_coverage_mean_pct"
+      ],
+      "min_marker_coverage_pct_observed": coverage_metrics[
+        "min_marker_coverage_pct_observed"
+      ],
+      "pct_time_below_coverage": coverage_metrics["pct_time_below_coverage"],
+      "n_markers_sustained_dropout": coverage_metrics["n_markers_sustained_dropout"],
       "raw_qc_preprocessing_status": raw_status,
       "raw_qc_status_reason": raw_reason,
     }
@@ -578,7 +717,7 @@ def build_unlabeled_summary(
   unlabeled_count_per_frame = unlabeled_valid.sum(axis=1).astype(int)
   any_unlabeled = unlabeled_count_per_frame > 0
 
-  labeled_markers = inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
+  labeled_markers = analysis_labeled_marker_names(inventory, config)
   if labeled_markers:
     labeled_valid = session.valid_marker_frame.sel(marker=labeled_markers).values
     labeled_missing_per_frame = (~labeled_valid).sum(axis=1).astype(int)
@@ -647,7 +786,7 @@ def build_frame_qc_mask(
   time_values = session.time_seconds.values
   inventory = session.marker_inventory
 
-  labeled_markers = inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
+  labeled_markers = analysis_labeled_marker_names(inventory, config)
   unlabeled_markers = inventory.loc[inventory["is_unlabeled"], "marker_name"].tolist()
 
   if labeled_markers:

@@ -19,6 +19,7 @@ from motive_qc.core import (
     SchemaValidationError,
     resolve_path,
 )
+from motive_qc.analysis_scope import compute_marker_analysis_flags
 from motive_qc.marker_meta import (
     build_marker_columns,
     filter_markers,
@@ -61,22 +62,23 @@ def run_layer1_parse(config: dict[str, Any], verbose: bool = False) -> QCResult:
   marker_names = marker_inventory["marker_name"].tolist()
   axis_row = header_rows[header_map["axis"]]
 
-  usecols = ["Frame", "Time (Seconds)"]
-  col_indices: dict[str, tuple[str, int]] = {}
+  # Lean read: load only Frame (col 0), Time (Seconds) (col 1), and the accepted
+  # marker X/Y/Z source columns. Solved rigid-body/skeleton/quaternion columns are
+  # never read into memory.
+  needed_indices = {0, 1}
   for _, row in marker_inventory.iterrows():
-    name = row["marker_name"]
     for axis in ("X", "Y", "Z"):
       source = row[f"{axis.lower()}_column_source"]
-      header_name = axis_row[int(source)] if source is not None else axis
-      col_key = f"{name}|{axis}"
-      usecols.append(col_key)
-      col_indices[col_key] = (name, int(source))
+      if source is not None:
+        needed_indices.add(int(source))
+  needed_sorted = sorted(needed_indices)
+  position_for_source = {orig: pos for pos, orig in enumerate(needed_sorted)}
 
-  # Read data with pandas using column indices
   all_cols = pd.read_csv(
     input_path,
     skiprows=data_start_idx - 1,
     header=0,
+    usecols=needed_sorted,
     encoding="utf-8-sig",
     low_memory=False,
   )
@@ -194,13 +196,14 @@ def run_layer1_parse(config: dict[str, Any], verbose: bool = False) -> QCResult:
     row = marker_inventory.loc[marker_inventory["marker_name"] == marker_name].iloc[0]
     for axis_idx, axis in enumerate(("X", "Y", "Z")):
       source = int(row[f"{axis.lower()}_column_source"])
-      if source >= len(raw_header):
+      pos = position_for_source.get(source)
+      if pos is None or pos >= len(raw_header):
         raise SchemaValidationError(
           f"Column index {source} out of range for marker {marker_name} axis {axis}."
         )
-      series = pd.to_numeric(all_cols.iloc[:, source], errors="coerce")
+      series = pd.to_numeric(all_cols.iloc[:, pos], errors="coerce")
       if fail_non_numeric:
-        raw = all_cols.iloc[:, source].astype(str).str.strip()
+        raw = all_cols.iloc[:, pos].astype(str).str.strip()
         non_empty = raw != ""
         bad = non_empty & series.isna()
         if bad.any():
@@ -212,6 +215,11 @@ def run_layer1_parse(config: dict[str, Any], verbose: bool = False) -> QCResult:
   valid = np.isfinite(coord_array).all(axis=2)
   finite_axes = np.isfinite(coord_array).sum(axis=2)
   partial_axis_invalid = int(((finite_axes > 0) & (finite_axes < 3)).sum())
+
+  # Single source of truth for the labeled / unlabeled / quarantined partition.
+  marker_inventory, partition_meta = compute_marker_analysis_flags(
+    marker_inventory, valid, marker_names, config, messages
+  )
   if partial_axis_invalid > 0:
     messages.append(
       QCMessage(
@@ -282,6 +290,12 @@ def run_layer1_parse(config: dict[str, Any], verbose: bool = False) -> QCResult:
     "time_column_status": time_column_status,
     "n_marker_triplets_total": len(marker_records),
     "n_labeled_markers": int(marker_inventory["is_labeled"].sum()),
+    "n_labeled_markers_in_analysis": int(marker_inventory["included_in_analysis"].sum()),
+    "n_quarantined_markers": int(
+      (marker_inventory["quarantine_reason"].astype(str).str.len() > 0).sum()
+    ),
+    "analysis_skeleton_prefix": partition_meta.get("analysis_skeleton_prefix", ""),
+    "skeleton_selection_events": partition_meta.get("skeleton_selection_events", []),
     "n_unlabeled_markers": int(marker_inventory["is_unlabeled"].sum()),
     "contains_marker_xyz": contains_marker_xyz,
     "contains_rigid_body_columns": contains_rigid,

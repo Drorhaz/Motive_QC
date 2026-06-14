@@ -6,3 +6,5 @@ openpyxl
 xlsxwriter
 xarray
 ipywidgets
+ipykernel
+tqdm

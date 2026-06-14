@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from motive_qc.core import LOGGER, MotiveSession, QCResult
-from motive_qc.gaps import build_frame_qc_mask
+from motive_qc.analysis_scope import analysis_labeled_marker_names
 from motive_qc.plots import (
     plot_frame_missingness_timeline,
     plot_gap_timeline_by_group,
@@ -40,7 +40,7 @@ def build_frame_quality_summary(
 
     frames = session.coordinates.coords["frame"].values
     inventory = session.marker_inventory
-    labeled = inventory.loc[inventory["is_labeled"], "marker_name"].tolist()
+    labeled = analysis_labeled_marker_names(inventory, config)
     critical_groups = set(fq_cfg.get("critical_groups", []))
 
     affected_groups: list[str] = []

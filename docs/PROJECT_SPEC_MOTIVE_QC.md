@@ -4,7 +4,7 @@
 **Primary data source:** OptiTrack Motive CSV export containing raw reconstructed marker XYZ trajectories  
 **Motive version to record:** Motive:Body 3.4.0.2  
 **Development mode:** Layered, validation-gated implementation  
-**Current implementation scope:** **Implement Layers 1-2 only. Stop after Layer 2 and wait for researcher validation.**
+**Current implementation scope:** **Layers 1–5 implemented (v0.5+). Layer 6 cross-session batch aggregator implemented (v0.6).**
 
 ---
 
@@ -113,6 +113,9 @@ Layer 3: Window safety verdict (L2 gaps + L4 events)         [implemented in mot
 Layer 5: Publication-ready report package                    [implemented in motive_qc v0.5]
     |
     v
+Layer 6: Cross-session batch aggregator + executive EDA    [implemented in motive_qc v0.6]
+    |
+    v
 Later separate pipeline: processed BVH validation             [future, separate spec]
 ```
 
@@ -122,16 +125,18 @@ Later separate pipeline: processed BVH validation             [future, separate 
 motive-qc/
 ├── PROJECT_SPEC_MOTIVE_QC.md
 ├── config.yaml
-├── motive_qc/                  # package: parse, gaps, artifacts, windows, report, output_tiers
-├── motive_raw_qc.py            # CLI entry point
+├── motive_qc/                  # package: parse, gaps, artifacts, windows, report, batch, output_tiers
+├── motive_raw_qc.py            # single-session CLI entry point
+├── motive_batch_qc.py          # Layer 6 batch CLI entry point
 ├── requirements.txt
 ├── notebooks/
 │   ├── 01_raw_csv_qc_layers_1_2.ipynb
 │   └── 02_raw_csv_qc_layers_3_5.ipynb
 ├── data/
-│   └── input_csv_here.csv
+│   └── {subject_id}/*.csv
 ├── outputs/
-│   └── runs/{session_id}_{timestamp}/   # essential or full tier per config
+│   ├── runs/{session_id}_{timestamp}/   # essential or full tier per config
+│   └── batch_runs/batch_{timestamp}/    # Layer 6 executive package
 └── docs/
     ├── notes/
     └── VALIDATION_LOG.md
@@ -142,7 +147,8 @@ motive-qc/
 | Component | Responsibility | Should contain heavy computation? |
 |---|---|---:|
 | `config.yaml` | Tunable scientific and engineering settings | No |
-| `motive_qc/` + `motive_raw_qc.py` | Layers 1-5 backend; CLI wrapper | Yes |
+| `motive_qc/` + `motive_raw_qc.py` | Layers 1-5 backend; single-session CLI wrapper | Yes |
+| `motive_qc/batch.py` + `motive_batch_qc.py` | Layer 6 batch orchestration and executive EDA | Yes |
 | Future modules, e.g. `motive_qc/parser.py` | Robust parsing logic | Yes |
 | Future modules, e.g. `motive_qc/gaps.py` | Missingness and gap detection | Yes |
 | Future modules, e.g. `motive_qc/plots.py` | Plot generation | Yes |
@@ -205,7 +211,7 @@ Layer 1 must extract or explicitly mark as unknown the following metadata.
 | Field | Type | Required behavior |
 |---|---|---|
 | `input_file` | string | Required. Absolute or relative path to raw CSV. |
-| `file_stem` | string | Required. Used for output naming if batch mode is added later. |
+| `file_stem` | string | Required. Used for output naming and batch session discovery. |
 | `motive_version` | string | From `config.yaml`; for this project record `Motive:Body 3.4.0.2`. |
 | `capture_frame_rate_hz` | float or null | Extract from CSV if present; otherwise warn. |
 | `export_frame_rate_hz` | float or null | Extract from CSV if present; otherwise use config override or fail. |
@@ -876,6 +882,99 @@ The report may say:
 The report must not say:
 
 > "The data are guaranteed raw" or "no filtering ever occurred."
+
+---
+
+## Layer 6 - Cross-Session Batch QC and Executive EDA Report
+
+### Status
+
+**Implemented** in `motive_qc/discovery.py`, `motive_qc/batch.py`, `motive_qc/batch_metrics.py`, `motive_qc/batch_report.py`, `motive_qc/batch_workbook.py`, and `motive_batch_qc.py` (v0.6).
+
+### Goal
+
+Orchestrate Layers 1–5 across many Motive CSV sessions under `data/{subject_id}/`, aggregate per-session QC metrics into a PI-facing executive package, and continue on per-session failure without blocking the full batch.
+
+Layer 6 does **not** re-implement gap, artifact, or window logic — it deep-copies `config.yaml`, overrides `paths.input_csv` and `project.subject_id` / `project.session_id` per discovered session, runs `run_full_pipeline`, and extracts EDA rows from in-memory `QCResult` objects.
+
+### Discovery
+
+| Function | Role |
+|---|---|
+| `discover_subjects(config)` | Subject folders under `paths.data_root` with at least one CSV |
+| `discover_sessions(config, subject_ids=..., session_filter=...)` | Catalog DataFrame: `csv_path`, `file_name`, `subject_id`, `session_id`, `parse_ok`, `file_size_mb` |
+| `validate_csv_header(path)` | Header-only validation before full L1 parse |
+| `apply_session_to_config(config, row)` | Per-session config override |
+
+Filename regex: `^(\d+)_(T\d+_P\d+_R\d+)_` with fallback `parse_ok=False` and sanitized stem.
+
+Config additions:
+
+- `paths.data_root`, `paths.batch_output_dir`, `paths.exclude_globs`, `paths.include_globs`
+- `batch.continue_on_error`, `batch.sort_by`, `batch.progress_bar`
+
+### Batch output contract
+
+```
+outputs/batch_runs/batch_{YYYYMMDD_HHMMSS}/
+├── BATCH_MANIFEST.json
+├── dataset_eda_report.csv
+├── dataset_eda_report.md           # PI narrative deliverable
+├── dataset_eda_report.xlsx
+├── dataset_eda_workbook.xlsx       # PI workbook: ExecutiveSummary + per-session gap/artifact tabs
+├── failures.csv                    # if any session failed
+├── config_snapshot.yaml
+├── plots/
+│   ├── batch_preprocessing_status.png
+│   ├── batch_window_yield.png
+│   ├── batch_artifact_events.png
+│   └── batch_missingness.png
+├── sessions/
+│   └── {subject_id}_{session_id}.json
+└── details/
+    ├── top_markers_by_session.csv
+    ├── artifact_type_distribution.csv
+    └── velocity_by_body_segment.csv
+```
+
+Per-session full L1–L5 outputs remain in `outputs/runs/{session_id}_{timestamp}/` (unchanged).
+
+### Executive table (`dataset_eda_report.csv`)
+
+One row per session including: identity, scale (duration, frames, frame rate, marker count), missingness and gap breakdown, preprocessing status, artifact event counts by class, window yield (0.5 s / 1.0 s), frame mask percentages, tuning parameters frozen from config, velocity-by-segment summaries in `details/`.
+
+Metrics are extracted from in-memory pipeline results so essential output tier does not block EDA (e.g. `marker_quality_summary` in layer2 tables).
+
+### PI workbook (`dataset_eda_workbook.xlsx`)
+
+Structured Excel deliverable for PI review (in addition to flat `dataset_eda_report.xlsx`):
+
+| Sheet | Content |
+|---|---|
+| `ExecutiveSummary` | Session inventory; gap buckets and `pct_session_gap_time_ge_0p2`; artifact method blurb + per-session candidate-frame %; major segment burden |
+| `{subject}_{session}` | Gap windows (0.5 s, max gap ≥ 0.2 s): start/end seconds; artifact events: start/end seconds |
+
+Built from in-memory `SessionBatchResult` layer outputs (no disk re-read).
+
+### CLI
+
+```bash
+python motive_batch_qc.py --config config.yaml --discover
+python motive_batch_qc.py --config config.yaml --all-subjects --verbose
+python motive_batch_qc.py --config config.yaml --subject 671 --sessions T2_P1_R1,T3_P1_R2 --verbose
+```
+
+Exit code `0` if all sessions pass; `1` if any failure (with `failures.csv`).
+
+### Notebook integration
+
+Notebook `02_raw_csv_qc_layers_3_5.ipynb` includes a session picker and **Run batch for PI** button calling `run_batch()`. Researcher runs batch; PI receives `dataset_eda_report.md` without running CLI or notebooks.
+
+### Out of scope (v0.6)
+
+- Parallel/multiprocessing batch runs
+- Savitzky-Golay velocity in batch EDA
+- Auto PCA/jPCA execution
 
 ---
 
